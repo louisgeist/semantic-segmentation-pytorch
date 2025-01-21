@@ -16,6 +16,9 @@ from mit_semseg.utils import AverageMeter, parse_devices, setup_logger
 from mit_semseg.lib.nn import UserScatteredDataParallel, user_scattered_collate, patch_replication_callback
 
 
+import torch.profiler
+import json
+
 # train one epoch
 def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
     batch_time = AverageMeter()
@@ -26,64 +29,67 @@ def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
     segmentation_module.train(not cfg.TRAIN.fix_bn)
     segmentation_module.set_epoch(epoch)
 
-    # main loop
-    tic = time.time()
-    for i in range(cfg.TRAIN.epoch_iters):
-        # load a batch of data
-        batch_data = next(iterator)
-        # Convertir la liste en dictionnaire si nécessaire
-        if isinstance(batch_data, list):
-            if not len(batch_data) == 1:
-                raise ValueError("bizarre")
-            batch_data = batch_data[0]
-            
-        data_time.update(time.time() - tic)
-        segmentation_module.zero_grad()
-
-        # Pour chaque batch
-        segmentation_module.set_iteration(i)
-        
-        # Ajouter les temps dans le feed_dict
-        batch_data = batch_data.copy()  # Pour éviter de modifier l'original
-        batch_data['data_time'] = data_time.val  # Utiliser la valeur actuelle plutôt que la moyenne
-        batch_data['gpu_time'] = batch_time.val if batch_time.val else 0.0
-
-        # adjust learning rate
-        cur_iter = i + (epoch - 1) * cfg.TRAIN.epoch_iters
-        adjust_learning_rate(optimizers, cur_iter, cfg)
-
-        # forward pass
-        loss, acc = segmentation_module(batch_data)
-        loss = loss.mean()
-        acc = acc.mean()
-
-        # Backward
-        loss.backward()
-        for optimizer in optimizers:
-            optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - tic)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA
+        ],
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
         tic = time.time()
+        for i in range(cfg.TRAIN.epoch_iters):
+            batch_data = next(iterator)
+            if isinstance(batch_data, list):
+                if not len(batch_data) == 1:
+                    raise ValueError("bizarre")
+                batch_data = batch_data[0]
 
-        # update average loss and acc
-        ave_total_loss.update(loss.data.item())
-        ave_acc.update(acc.data.item()*100)
+            data_time.update(time.time() - tic)
+            segmentation_module.zero_grad()
 
-        # calculate accuracy, and display
-        if i % cfg.TRAIN.disp_iter == 0:
-            print('Epoch: [{}][{}/{}], Time: {:.2f}, Data: {:.2f}, '
-                  'lr_encoder: {:.6f}, lr_decoder: {:.6f}, '
-                  'Accuracy: {:4.2f}, Loss: {:.6f}'
-                  .format(epoch, i, cfg.TRAIN.epoch_iters,
-                          batch_time.average(), data_time.average(),
-                          cfg.TRAIN.running_lr_encoder, cfg.TRAIN.running_lr_decoder,
-                          ave_acc.average(), ave_total_loss.average()))
+            segmentation_module.set_iteration(i)
 
-            fractional_epoch = epoch - 1 + 1. * i / cfg.TRAIN.epoch_iters
-            history['train']['epoch'].append(fractional_epoch)
-            history['train']['loss'].append(loss.data.item())
-            history['train']['acc'].append(acc.data.item())
+            batch_data = batch_data.copy()
+            batch_data['data_time'] = data_time.val
+            batch_data['gpu_time'] = batch_time.val if batch_time.val else 0.0
+
+            cur_iter = i + (epoch - 1) * cfg.TRAIN.epoch_iters
+            adjust_learning_rate(optimizers, cur_iter, cfg)
+
+            # forward pass
+            loss, acc = segmentation_module(batch_data)
+            loss = loss.mean()
+            acc = acc.mean()
+
+            # Backward
+            loss.backward()
+            for optimizer in optimizers:
+                optimizer.step()
+
+            batch_time.update(time.time() - tic)
+            tic = time.time()
+
+            ave_total_loss.update(loss.data.item())
+            ave_acc.update(acc.data.item() * 100)
+
+            if i % cfg.TRAIN.disp_iter == 0:
+                print('Epoch: [{}][{}/{}], Time: {:.2f}, Data: {:.2f}, '
+                      'Accuracy: {:4.2f}, Loss: {:.6f}'
+                      .format(epoch, i, cfg.TRAIN.epoch_iters,
+                              batch_time.average(), data_time.average(),
+                              ave_acc.average(), ave_total_loss.average()))
+
+    # Export profiler results to JSON
+    prof.export_chrome_trace(f'profiler_results_epoch_{epoch}.json')
+
+    # Optionally, you can also convert the profiler results to a dictionary and save it as JSON
+    results_dict = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+    with open(f'profiler_summary_epoch_{epoch}.json', 'w') as json_file:
+        json.dump(results_dict, json_file)
+
+    print(f"Profiler results saved to profiler_results_epoch_{epoch}.json")
+    print(f"Profiler summary saved to profiler_summary_epoch_{epoch}.json")
 
 
 def checkpoint(nets, history, cfg, epoch):
