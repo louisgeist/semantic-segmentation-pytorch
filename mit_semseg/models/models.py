@@ -4,6 +4,7 @@ from . import resnet, resnext, mobilenet, hrnet
 from mit_semseg.lib.nn import SynchronizedBatchNorm2d
 BatchNorm2d = SynchronizedBatchNorm2d
 
+import csv
 
 class SegmentationModuleBase(nn.Module):
     def __init__(self):
@@ -19,14 +20,82 @@ class SegmentationModuleBase(nn.Module):
 
 
 class SegmentationModule(SegmentationModuleBase):
-    def __init__(self, net_enc, net_dec, crit, deep_sup_scale=None):
+    def __init__(self, net_enc, net_dec, crit, deep_sup_scale=None, stats_path='training_stats.csv', save_freq=1000):
         super(SegmentationModule, self).__init__()
         self.encoder = net_enc
         self.decoder = net_dec
         self.crit = crit
         self.deep_sup_scale = deep_sup_scale
+        
+        # Déplacer tout le modèle sur GPU si disponible
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print("used device :", self.device)
+        self.to(self.device)
+
+        # Initialisation des statistiques
+        self.stats_path = stats_path
+        self.current_epoch = 0
+        self.current_iter = 0
+        self.save_freq = save_freq
+        
+        # Pour calculer les moyennes
+        self.running_loss = 0.0
+        self.running_acc = 0.0
+        self.running_data_time = 0.0
+        self.running_gpu_time = 0.0
+        self.stats_count = 0
+        
+        # Créer/Initialiser le fichier CSV avec les en-têtes si nécessaire
+        import os
+        if not os.path.exists(self.stats_path):
+            with open(self.stats_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Epoch', 'Iteration', 'Loss', 'Accuracy', 'Data_Time', 'GPU_Time', 'Stats_Count'])
+
+    def save_stats(self, loss, acc, data_time, gpu_time):
+        """Sauvegarder les statistiques dans le fichier CSV"""
+        # Accumuler les statistiques
+        self.running_loss += float(loss)
+        self.running_acc += float(acc)
+        self.running_data_time += float(data_time)
+        self.running_gpu_time += float(gpu_time)
+        self.stats_count += 1
+        
+        # Sauvegarder et réinitialiser toutes les save_freq itérations
+        if self.current_iter % self.save_freq == 0 and self.stats_count > 0:
+            # Calculer les moyennes
+            avg_loss = self.running_loss / self.stats_count
+            avg_acc = self.running_acc / self.stats_count
+            avg_data_time = self.running_data_time / self.stats_count
+            avg_gpu_time = self.running_gpu_time / self.stats_count
+            
+            # Sauvegarder dans le CSV
+            with open(self.stats_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.current_epoch,
+                    self.current_iter,
+                    avg_loss,
+                    avg_acc,
+                    avg_data_time,
+                    avg_gpu_time,
+                    self.stats_count
+                ])
+            
+            # Réinitialiser les compteurs
+            self.running_loss = 0.0
+            self.running_acc = 0.0
+            self.running_data_time = 0.0
+            self.running_gpu_time = 0.0
+            self.stats_count = 0
 
     def forward(self, feed_dict, *, segSize=None):
+        # S'assurer que les données d'entrée sont sur le même device que le modèle
+        if isinstance(feed_dict['img_data'], torch.Tensor):
+            feed_dict['img_data'] = feed_dict['img_data'].to(self.device)
+        if 'seg_label' in feed_dict and isinstance(feed_dict['seg_label'], torch.Tensor):
+            feed_dict['seg_label'] = feed_dict['seg_label'].to(self.device)
+            
         # training
         if segSize is None:
             if self.deep_sup_scale is not None: # use deep supervision technique
@@ -40,11 +109,29 @@ class SegmentationModule(SegmentationModuleBase):
                 loss = loss + loss_deepsup * self.deep_sup_scale
 
             acc = self.pixel_acc(pred, feed_dict['seg_label'])
+            
+            # Sauvegarder les stats si data_time et gpu_time sont fournis dans feed_dict
+            if 'data_time' in feed_dict and 'gpu_time' in feed_dict:
+                self.save_stats(
+                    loss.item(),
+                    acc.item(),
+                    feed_dict['data_time'],
+                    feed_dict['gpu_time']
+                )
+            
             return loss, acc
         # inference
         else:
             pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True), segSize=segSize)
             return pred
+
+    def set_epoch(self, epoch):
+        """Mettre à jour le numéro d'époque"""
+        self.current_epoch = epoch
+
+    def set_iteration(self, iter):
+        """Mettre à jour le numéro d'itération"""
+        self.current_iter = iter
 
 
 class ModelBuilder:
@@ -62,7 +149,7 @@ class ModelBuilder:
 
     @staticmethod
     def build_encoder(arch='resnet50dilated', fc_dim=512, weights=''):
-        pretrained = True if len(weights) == 0 else False
+        pretrained = False  # True if len(weights) == 0 else False
         arch = arch.lower()
         if arch == 'mobilenetv2dilated':
             orig_mobilenet = mobilenet.__dict__['mobilenetv2'](pretrained=pretrained)

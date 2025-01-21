@@ -4,6 +4,7 @@ ckpt/
 vis/
 log/
 pretrained/
+data/
 
 .ipynb_checkpoints
 
@@ -11,3 +12,4 @@ ADE_val*.jpg
 ADE_val*.png
 
 .idea/
+.vscode/

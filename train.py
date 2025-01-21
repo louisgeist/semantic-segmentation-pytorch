@@ -24,14 +24,29 @@ def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
     ave_acc = AverageMeter()
 
     segmentation_module.train(not cfg.TRAIN.fix_bn)
+    segmentation_module.set_epoch(epoch)
 
     # main loop
     tic = time.time()
     for i in range(cfg.TRAIN.epoch_iters):
         # load a batch of data
         batch_data = next(iterator)
+        # Convertir la liste en dictionnaire si nécessaire
+        if isinstance(batch_data, list):
+            if not len(batch_data) == 1:
+                raise ValueError("bizarre")
+            batch_data = batch_data[0]
+            
         data_time.update(time.time() - tic)
         segmentation_module.zero_grad()
+
+        # Pour chaque batch
+        segmentation_module.set_iteration(i)
+        
+        # Ajouter les temps dans le feed_dict
+        batch_data = batch_data.copy()  # Pour éviter de modifier l'original
+        batch_data['data_time'] = data_time.val  # Utiliser la valeur actuelle plutôt que la moyenne
+        batch_data['gpu_time'] = batch_time.val if batch_time.val else 0.0
 
         # adjust learning rate
         cur_iter = i + (epoch - 1) * cfg.TRAIN.epoch_iters
@@ -152,13 +167,17 @@ def main(cfg, gpus):
         weights=cfg.MODEL.weights_decoder)
 
     crit = nn.NLLLoss(ignore_index=-1)
-
+    save_freq = 20
     if cfg.MODEL.arch_decoder.endswith('deepsup'):
         segmentation_module = SegmentationModule(
-            net_encoder, net_decoder, crit, cfg.TRAIN.deep_sup_scale)
+            net_encoder, net_decoder, crit, cfg.TRAIN.deep_sup_scale,
+            stats_path=os.path.join(cfg.DIR, 'training_stats.csv'),
+            save_freq=save_freq)
     else:
         segmentation_module = SegmentationModule(
-            net_encoder, net_decoder, crit)
+            net_encoder, net_decoder, crit,
+            stats_path=os.path.join(cfg.DIR, 'training_stats.csv'),
+            save_freq=save_freq)
 
     # Dataset and Loader
     dataset_train = TrainDataset(
@@ -187,7 +206,10 @@ def main(cfg, gpus):
             device_ids=gpus)
         # For sync bn
         patch_replication_callback(segmentation_module)
-    segmentation_module.cuda()
+    if torch.cuda.is_available():
+        segmentation_module.cuda()
+    else:
+        print("CUDA n'est pas disponible, utilisation du CPU")
 
     # Set up optimizers
     nets = (net_encoder, net_decoder, crit)
